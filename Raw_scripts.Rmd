@@ -1,0 +1,1431 @@
+---
+title: "Analysis on CDK4/6i + BETi +  Combo Synergy"
+output: html_document
+date: "2025-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Libraries 
+```{r}
+suppressPackageStartupMessages({
+  library(ggplot2);library(ggrepel);library(ggpubr);
+  library(data.table);library(RColorBrewer);library(tidyverse);
+  library(preprocessCore);library(future.apply);library(DESeq2);
+  library(pheatmap);library(sva);library(viridis);
+  library(limma);library(emmeans);library(broom);
+  library(janitor);library(tidyplots);library(dplyr);
+  library(writexl);library(scToppR);library(fgsea);
+  library(clusterProfiler);library(org.Hs.eg.db);library(dplyr);library(readxl)
+})
+```
+
+##############
+#------------- Loading counts and processing
+```{r}
+gene_counts<- read_xlsx("edgeR_new_exploration/counts.xlsx")
+counts<- gene_counts |> filter(gene_biotype == "protein_coding") |>
+  dplyr::select(gene_name, 2:13) |>
+  dplyr::select(
+    gene_name,
+    DMSO_1, DMSO_2, DMSO_3,
+    BMS_2, BMS_3, BMS_4,
+    Ribo_1, Ribo_2, Ribo_3,
+    Combo_1, Combo_3, Combo_4
+  )
+rownames(counts)<- NULL
+
+p_exp <- counts |>
+  dplyr::distinct(gene_name, .keep_all = TRUE)
+rownames(p_exp)<- NULL
+p_exp <- p_exp |> column_to_rownames('gene_name')
+
+# Reading metadata
+metadata<- read.csv("edgeR_new_exploration/metadata.csv")
+metadata<- metadata |> column_to_rownames("X")
+metadata$Condition<-factor(trimws(metadata$Condition))
+metadata$Condition<-factor(metadata$Condition, levels = c("DMSO","BMS", "Ribo", "Combo"))
+levels(metadata$Condition)
+
+all(colnames(p_exp) == rownames(metadata))
+```
+##############
+#------------- CPM normalization
+```{r}
+## Converting to cpms: Counts per million 
+cpm <-future_apply(p_exp, 2, function(x) x/sum(as.numeric(x)) * 10^6) 
+
+## Filter low cpm counts for both conditions 
+filter<-apply(cpm, 1, function(x) all(x[1:3]>=0.5) | all(x[4:6]>=0.5) | all(x[7:9]>=0.5) | all(x[10:12]>=0.5))
+counts_filt <- p_exp[filter,]  ## 13772 genes
+cpm_filt <- cpm[filter,]   ## 13772 genes
+
+#### Saving cpm and counts filter
+cpm_filt_xlsx<-cpm_filt %>% as.data.frame() %>% tibble::rownames_to_column(var = "Gene")
+write_xlsx(cpm_filt_xlsx, "edgeR_new_exploration/deg/gene_cpm.xlsx")
+
+counts_filt_xlsx<-counts_filt %>%as.data.frame() %>%tibble::rownames_to_column(var = "Gene")
+write_xlsx(counts_filt_xlsx, "edgeR_new_exploration/deg/gene_filt_counts.xlsx")
+
+## Applying log_transformation
+logCPM<- log2(cpm_filt +1)
+boxplot(logCPM)
+
+## Normalizing quantiles from cpm counts
+p<- normalize.quantiles(as.matrix(logCPM))
+rownames(p)<-rownames(logCPM)
+colnames(p) <-colnames(logCPM)
+boxplot(p)
+
+## Performing PCA using the quantile normalization from the CPMs and Visualize
+metadata$Subject_ID<- rownames(metadata)
+pca.Samples<-prcomp(t(p))
+PCi<-data.frame(pca.Samples$x, Condition= metadata$Condition, ID= metadata$Subject_ID )
+eig <- (pca.Samples$sdev)^2 ### Calculating the eigenvalue
+variance <- eig*100/sum(eig) ## Calculating variance
+pdf("edgeR_new_exploration/deg/PCA_cpms.pdf",width=7,height=5,useDingbats=FALSE)
+ggscatter(
+  PCi,
+  x = "PC1",
+  y = "PC2",
+  color = "Condition",
+  palette = c("#D8CE7A", "#A5D996", "#8259D9", "blue4"),
+  size = 6,
+  ellipse = TRUE,
+  ellipse.type = "confidence",
+  ellipse.alpha = 0.2
+) +
+  xlab(paste("PC1 (", round(variance[1],1), "% )")) +
+  ylab(paste("PC2 (", round(variance[2],1), "% )")) +
+  labs(color = "Condition", fill = "Condition") +
+  scale_color_manual(
+    values = c("#D8CE7A", "#A5D996", "#8259D9", "blue4"),
+    labels = c("DMSO", "BETi", "CDK4/6i", "Combo")
+  ) +
+  scale_fill_manual(
+    values = c("#D8CE7A", "#A5D996", "#8259D9", "blue4"),
+    labels = c("DMSO", "BETi", "CDK4/6i", "Combo")
+  ) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12.5),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(0.2, "cm"))
+dev.off()
+```
+##############
+#------------- Differential expression analysis using DESEQ2
+```{r}
+### Setting metadata conodition as : DMSO as reference
+metadata$Condition<- factor(metadata$Condition)
+metadata$Condition <- relevel(metadata$Condition, ref = "DMSO")
+
+## Creating DESEq object 
+dds<- DESeqDataSetFromMatrix(countData = p_exp,colData = metadata, design = ~ Condition)
+#counts(dds)
+## Estimating factors
+dds<-estimateSizeFactors(dds)
+## Performing DESEq
+dds<-DESeq(dds, full = design(dds),betaPrior = FALSE)
+resultsNames(dds)
+
+### #####
+####--------- Obtaining resulst 
+cd <- "Condition_Combo_vs_DMSO"  #--< Changing according to purposes
+res = results(dds, name = cd)
+head(res[order(res$padj),]) ## order to FDR
+#### Saving
+CTX_FullTab <-as.data.frame(results(dds, name = cd, cooksCutoff = F, independentFiltering = F))%>% rownames_to_column("Gene")
+CTX_DGE <- CTX_FullTab %>%
+  mutate(Abs = abs(log2FoldChange)) %>%
+  filter(padj < 0.05 & Abs > 0.3) %>% 
+  arrange(desc(Abs))
+
+### Saving 
+## Establishing filepath --< Changing accoridng to purposes
+file_path<- "edgeR_new_exploration/Refinment/deg/Combo_BMS/"
+
+write_xlsx(CTX_FullTab, file.path(file_path, "CTX_FullTab.xlsx"))
+write_xlsx(CTX_DGE, file.path(file_path, "CTX_DGE.xlsx"))
+
+###################
+### Shrinkage
+res_shrink<-lfcShrink(dds, coef = cd, type = "ashr" )
+degs_shrink<- subset(res_shrink, padj < 0.05 & abs(log2FoldChange) > 0.3 )
+
+### Getting dataframes
+CTX_FullTab_shrink<- as.data.frame(res_shrink) %>%rownames_to_column("Gene")
+CTX_DGE_shrink<-as.data.frame(degs_shrink) %>%rownames_to_column("Gene")
+
+write_xlsx(CTX_FullTab_shrink, file.path(file_path, "CTX_FullTab_shrink.xlsx"))
+write_xlsx(CTX_DGE_shrink, file.path(file_path, "CTX_DGE_shrink.xlsx"))
+
+save(CTX_FullTab, CTX_DGE, CTX_FullTab_shrink, CTX_DGE_shrink, metadata, metadata, 
+     file = file.path(file_path, "CTX_Dge_Data.RData"))
+
+save(dds, file = file.path(file_path, "Ref_DMSO.RData"))
+```
+
+
+######### Loading one by one exploring each dataset 
+###### Visualizations of the shrinkage data
+##### Volcano plots ##### ##### #####
+```{r}
+### Loading one by one
+data<- read_xlsx("edgeR_new_exploration/deg/Combo_Ribo/CTX_FullTab_shrink.xlsx")
+## Creatimng temporary dataframe
+df <- unique_BMS %>%
+  mutate(LOG = -log10(padj), ABS = abs(log2FoldChange)) %>%
+  mutate(Threshold = if_else(padj < 0.05 & ABS > 0.3, "TRUE","FALSE")) %>%
+  mutate(Direction = case_when(log2FoldChange > 0.3 & padj < 0.05 ~ "UpReg", log2FoldChange < -0.3 & padj < 0.05 ~ "DownReg")) ### why 0.3
+dim(df)
+
+write_xlsx(unique_Ribo, "edgeR_new_exploration/deg/Unique_Ribo/unique_Ribo_DEGs.xlsx")
+#df<- df |> filter(padj > 0)
+### Top genes based on Direction and padj
+### These genes are the most statistically significance
+top_labelled <- df %>%
+  group_by(Direction) %>%
+  na.omit() %>%
+  arrange(padj) %>%
+  top_n(n = 7, wt = LOG)
+
+head(top_labelled)
+
+pdf("edgeR_new_exploration/deg/Unique_Ribo/Volcano_Plot_CTX.pdf",width=6,height=6,useDingbats=FALSE)
+ggscatter(df,
+          x="log2FoldChange",
+          y="LOG",
+          color = "Direction",
+          palette=c("dodgerblue1","firebrick1"),
+          size = 1,
+          alpha=0.3,
+          shape=19)+
+  xlab("log2(Fold Change)")+
+  ylab("-log10(FDR)")+
+  geom_vline(xintercept = 0, colour = "grey",linetype="dotted",size=1,alpha=0.5) +
+  geom_vline(xintercept = 0.3, colour = "black",linetype="dotted",size=1,alpha=0.5) +
+  geom_vline(xintercept = -0.3, colour = "black",linetype="dotted",size=1,alpha=0.5) +
+  geom_hline(yintercept = 1.3, colour = "grey",linetype="dotted",size=1,alpha=0.5) +
+  geom_text_repel(data = top_labelled,
+                  mapping = aes(label = Gene),
+                  size = 4,
+                  box.padding = unit(0.4, "lines"),
+                  point.padding = unit(0.4, "lines"))+
+  theme(legend.position="none")+
+  ylim(0,50) + xlim(-8,+8) 
+dev.off()
+
+
+#### Gene ontology
+### prioritize LOgfc ::100 up and down 
+```
+### Gene ontology #######
+################ ########
+```{r}
+library(scToppR)
+tmp1<- df|> filter(Direction %in% c("UpReg", "DownReg"))
+toppData <-  toppFun(
+       tmp1,
+       topp_categories = NULL,
+       cluster_col = "Direction",
+       gene_col = "Gene",
+       p_val_col = "padj",
+       logFC_col = "log2FoldChange",
+       pval_cutoff = 0.05,
+       min_genes = 10,
+       max_genes = 500,
+       max_results = 50
+     )
+toppPlot(
+       toppData,
+       category = "GeneOntologyMolecularFunction",
+       num_terms = 10,
+       p_val_adj = "BH",
+       p_val_display = "log",
+       save = TRUE,
+       #save_dir = "edgeR_new_exploration/deg/Unique_Ribo/GO/pseudobulk_moderate_GO",
+       width = 5,
+       height = 6
+     )
+```
+```{r}
+toppPlot(
+       toppData,
+       category = "GeneOntologyBiologicalProcess",
+       num_terms = 10,
+       p_val_adj = "BH",
+       p_val_display = "log",
+       save = TRUE,
+       #save_dir = "edgeR_new_exploration/deg/unique_Ribo/GO/pseudobulk_moderate_GO",
+       width = 5,
+       height = 6
+     )
+```
+```{r}
+save(toppData, file = "edgeR_new_exploration/deg/Unique_Ribo/GO/pseudobulk_moderate_GO/TopData.RData")
+GO<- toppData |> as.data.frame()
+library(writexl)
+write_xlsx(GO, "edgeR_new_exploration/deg/Unique_Ribo/GO/pseudobulk_moderate_GO/GO.xlsx")
+#write_xlsx(unique_Combo, "edgeR_new_exploration/deg/Unique_Ribo/Combo_unique_CTX_DGE_shrink.xlsx")
+```
+
+
+#### Viz for AMPK- signaling
+##### Volcano plot is not working ####
+###### ############### ###############
+```{r}
+library(readxl)
+Combo_DMSO<- read_xlsx("edgeR_new_exploration/deg/Combo_DMSO/CTX_FullTab_shrink.xlsx")
+## Volcano plot 
+ 
+top_labelled <- df %>%group_by(Direction) %>% filter(!Direction == "NS") %>% 
+  arrange(padj) %>%top_n(n = 10, wt = LOG)
+
+amp_genes<- c("Aak1", "Araf", " Bcr", " Cdc42bpa", " Mtor", "Dclk1",
+              "Ern1", "Gsk3b", "Lmtk2", "Mtor", "Pikfyve", "Prkaa1",
+              "Prkag1", "Prkx", "Pskh1", "Ripk2", "Rps6ka2", "Sik2",
+              "Srpk2", "Stk36", "Taok2", "Trio", "Ttbk1", 'Ttbk2',
+              "Wnk3", 'Wnk4'
+              )
+
+top_labelled <- df[df$Gene %in% amp_genes,]
+
+ggplot(df, aes(x = log2FoldChange, y = LOG)) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.title.x = element_text(size = 20),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 16),
+    axis.text.y  = element_text(size = 16),
+    axis.ticks   = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(0.25, "cm")
+  ) +
+  geom_point(aes(color = Direction), size = 1, alpha = 0.8, show.legend = FALSE) +
+  scale_color_manual(values = c(DownReg = "#5CACDB", NS = "grey", UpReg = "#EA7FA3")) +
+
+  ggnewscale::new_scale_color() +
+
+  geom_text_repel(
+    data = top_labelled,
+    aes(label = Gene, color = Direction),
+    max.overlaps = Inf,
+    size = 5,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = c(DownReg = "#2C78A6", UpReg = "#C64A6E")) +
+
+  geom_vline(xintercept = 0, linetype = 2, color = "red") +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = "red") +
+  xlab("avg_log2FC") +
+  ylab("-log10(adj p-value)") +
+  scale_x_continuous(limits = c(-10, 10))
+
+### Topdata just one 
+load("edgeR_new_exploration/deg/Unique_combo/GO/pseudobulk_moderate_GO/TopData.RData")
+x<- toppData
+x<- x |> filter(Name %in% c("AMP-activated protein kinase activity",
+                            "insulin receptor binding"
+                            ))
+toppPlot(
+       x,
+       category = "GeneOntologyMolecularFunction",
+       num_terms = 4,
+       p_val_adj = "BH",
+       p_val_display = "log",
+       save = TRUE,
+       save_dir = "edgeR_new_exploration/deg/Unique_combo/AMPK_signaling/",
+       width = 6,
+       height = 3.5
+     )
+
+```
+
+
+
+############
+### Heatmaps #####------
+############
+```{r}
+### Laoding the normalized matrix and the DEGs
+#CTX_DGE_shrink<- openxlsx::read.xlsx("deg/CTX_DGE_shrink.xlsx")
+counts_filt_xlsx<- openxlsx::read.xlsx("edgeR_new_exploration/deg/gene_cpm.xlsx")
+#metadata<- read.table("deg/metadata.txt")
+
+library(viridis)
+p_exp<- counts_filt_xlsx
+p_exp<- p_exp |> column_to_rownames("Gene")
+mat <- p_exp[rownames(p_exp)%in% amp_genes,] 
+
+dim(mat)
+
+anno<-metadata
+anno$Subject_ID<- NULL
+anno$Condition <- factor(anno$Condition, levels = c("DMSO", "Ribo", "BMS", "Combo"))
+my_colour = list(
+    Condition = c(DMSO = "#4CAF50", Ribo = "#E91E63",
+                  BMS = "darkblue", Combo = "darkred")
+)
+pdf("edgeR_new_exploration/deg/Combo_BMS/DEGs_Heatmap_CTX.pdf",width=6,height=7,useDingbats=FALSE)
+pheatmap(mat,
+         scale="row",
+         show_rownames = F,
+         annotation= anno,
+         annotation_colors = my_colour,
+         colorRampPalette(rev(viridis(100)))(100),
+         cellwidth = 12,
+         #cutree_cols = 2,
+         angle_col = 45,
+         cluster_cols = F
+         )
+dev.off()
+
+### Creating a heatmap of the most uoregulated and downregylated genes
+top_up <- unique_Combo[order(unique_Combo$log2FoldChange, decreasing = TRUE), ][1:20, ]
+top_down <- unique_Combo[order(unique_Combo$log2FoldChange, decreasing = FALSE), ][1:20, ]
+top_bind <- rbind(top_up, top_down)
+
+### MODIFYING THE P_exp to have just the Combo vs DMSO
+q<- p_exp |> dplyr::select(1:3, 10:12)
+mat <- q[rownames(q)%in% top_bind$Gene,]
+anno<-metadata
+anno$Subject_ID<- NULL
+anno$Condition <- factor(anno$Condition, levels = c("DMSO", "Ribo", "BMS", "Combo"))
+my_colour = list(
+    Condition = c(DMSO = "#4CAF50", Ribo = "#E91E63",
+                  BMS = "darkblue", Combo = "darkred")
+)
+anno$Sex<- NULL
+pdf("edgeR_new_exploration/deg/Synergy_modeling/Top0.1Heatmap_CTX.pdf",width=7,height=4,useDingbats=FALSE)
+pheatmap(mat,
+         scale="row",
+         show_rownames = TRUE,
+         annotation= anno,
+         annotation_colors = my_colour,
+         cutree_cols = 2,
+         cellwidth = 20,
+         cellheight = 8.5,
+         border_color = "black",
+         angle_col = 45,
+         cluster_cols = F
+         )
+dev.off()
+
+
+### Heatmap pf the AMPK signaling 
+mat <- p_exp[rownames(p_exp)%in% amp_genes,]
+q<- mat |> dplyr::select(1:3, 10:12)
+q<- as.matrix(q)
+
+metadata<- read_csv("edgeR_new_exploration/metadata.csv")
+anno<-metadata
+anno<- anno |> column_to_rownames('...1')
+anno$Sex <- NULL
+#anno$Subject_ID<- NULL
+anno$Condition <- factor(anno$Condition, levels = c("DMSO", "Ribo", "BMS", "Combo"))
+#my_colour = list(
+#    Condition = c(DMSO = "#4CAF50", Ribo = "#E91E63",
+#                  BMS = "darkblue", Combo = "darkred")
+#)
+
+my_colour = list(
+    Condition = c(DMSO = "#4CAF50", Combo = "darkred")
+)
+pdf("edgeR_new_exploration/deg/Unique_combo/AMP_KHeatmap_CTX.pdf",width=7,height=5,useDingbats=FALSE)
+pheatmap(q,
+         scale="row",
+         show_rownames = TRUE,
+         annotation= anno,
+         annotation_colors = my_colour,
+         cutree_cols = 2,
+         cellwidth = 20,
+         cellheight = 8.5,
+         border_color = "black",
+         angle_col = 45,
+         cluster_cols = T
+         )
+dev.off()
+```
+
+#### GSEA ####
+##############
+```{r}
+run_gsea_per_cluster <- function(df,
+                                 pathway_list,
+                                 gene_col    = "feature",
+                                 stat_col    = "logFC",
+                                 cluster_col = "group",
+                                 output_dir  = "deg/GSEA/",
+                                 nperm       = 10000,
+                                 minSize     = 10,
+                                 maxSize     = 500,
+                                 padj_cutoff = 0.05,
+                                 label_prefix = "contrast") {
+
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+  clusts <- sort(unique(df[[cluster_col]]))
+  message("Running GSEA for ", length(clusts), " clusters: ",
+          paste(clusts, collapse = ", "))
+
+  per_cluster <- map(clusts, function(cl) {
+    sub <- df %>%
+      filter(.data[[cluster_col]] == cl) %>%
+      filter(!is.na(.data[[stat_col]])) %>%
+      # If a gene appears multiple times within a cluster, keep the largest |stat|
+      arrange(desc(abs(.data[[stat_col]]))) %>%
+      distinct(.data[[gene_col]], .keep_all = TRUE) %>%
+      arrange(desc(.data[[stat_col]]))
+
+    stat_vec <- sub[[stat_col]]
+    names(stat_vec) <- sub[[gene_col]]
+
+    if (length(stat_vec) < minSize) {
+      warning("Cluster ", cl, ": fewer than minSize genes (", length(stat_vec), "). Skipping.")
+      return(tibble())
+    }
+
+    set.seed(0708)
+    fg <- fgsea(pathways = pathway_list,
+                stats    = stat_vec,
+                nperm    = nperm,
+                minSize  = minSize,
+                maxSize  = maxSize)
+
+    res <- as_tibble(fg) %>%
+      arrange(padj, desc(NES)) %>%
+      mutate(cluster = cl, label = label_prefix)
+
+    # Save per-cluster results
+    write_csv(res, file.path(output_dir, sprintf("%s_cluster-%s_GSEA.csv", label_prefix, cl)))
+
+    # Also save significant up/down
+    up   <- res %>% filter(padj < padj_cutoff, ES > 0)
+    down <- res %>% filter(padj < padj_cutoff, ES < 0)
+    write_csv(up,   file.path(output_dir, sprintf("%s_cluster-%s_GSEA_up.csv",   label_prefix, cl)))
+    write_csv(down, file.path(output_dir, sprintf("%s_cluster-%s_GSEA_down.csv", label_prefix, cl)))
+
+    res
+  })
+
+  combined <- bind_rows(per_cluster)
+
+  # Save combined table (all clusters)
+  write_csv(combined, file.path(output_dir, sprintf("%s_ALL_clusters_GSEA.csv", label_prefix)))
+
+  invisible(list(per_cluster = per_cluster, combined = combined))
+}
+#BiocManager::install("fgsea")
+library(fgsea)
+hallmark_pathways <- gmtPathways("edgeR_new_exploration/deg/BMS_DMSO/GSEA/mh.all.v2024.1.Mm.symbols.gmt")
+
+df$cluster<- "CombovsRibo"
+res <- run_gsea_per_cluster(
+  df           = df,
+  pathway_list = hallmark_pathways,
+  gene_col     = "Gene",
+  stat_col     = "log2FoldChange",
+  cluster_col  = "cluster",
+  output_dir   = "edgeR_new_exploration/deg/Combo_Ribo/GSEA/",
+  nperm        = 10000,
+  label_prefix = "Combo_vs_Ribo"
+)
+
+res$combined %>% 
+  arrange(padj) %>% 
+  head(50)
+
+### Saving GSEA output 
+gsea_output1<-res$combined |>
+  as.data.frame()
+gsea_output1$leadingEdge <- sapply(gsea_output1$leadingEdge, function(x) paste(x, collapse = ", "))
+write.csv(gsea_output1, "edgeR_new_exploration/deg/Combo_Ribo/GSEA/full_genes_list_GSEA.csv")
+save(res, file = 'edgeR_new_exploration/deg/Combo_Ribo/GSEA/GSEA.RData')
+```
+
+```{r}
+plot_bulk_gsea_barplot_by_cluster <- function(gsea_df,
+                                              cluster_col = "group",
+                                              output_dir = "deg/GSEA/",
+                                              label = "sCRNAseq") {
+  library(ggpubr)
+  library(ggplot2)
+
+  # Create output dir
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  clusts <- sort(unique(gsea_df[[cluster_col]]))
+
+  for (cl in clusts) {
+    # Subset this cluster
+    df_cl <- gsea_df[gsea_df[[cluster_col]] == cl, , drop = FALSE]
+
+    # Preprocess for plotting (same as your function)
+    tpm <- df_cl %>%
+      mutate(adjPvalue = ifelse(padj <= 0.05, "significant", "non-significant"),
+             pathway = gsub("HALLMARK_", "", pathway))  # Clean pathway names if Hallmark
+
+    # Define colors (same)
+    cols <- c("non-significant" = "black", "significant" = "#CD4071FF")
+
+    # Create barplot for downregulated pathways (ES < 0) — same format
+    p <- ggbarplot(tpm %>% filter(ES > 0),
+                   x = "pathway", y = "NES",
+                   fill = "adjPvalue",
+                   color = "white",
+                   palette = cols,
+                   sort.val = "asc",
+                   sort.by.groups = FALSE,
+                   x.text.angle = 90,
+                   ylab = "NES",
+                   legend.title = "FDR < 0.05",
+                   rotate = TRUE,
+                   ggtheme = theme_minimal()) +
+      theme(
+        axis.text.x = element_text(size = 18, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black", face = "bold"),
+        axis.text.y = element_text(size = 14, color = "black"),
+        axis.title.y = element_text(size = 16, color = "black", face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)
+      )
+
+    # Save plot (one file per cluster)
+    ggsave(
+      filename = file.path(output_dir, paste0(label, "_cluster-", cl, "_Upregulated_GSEA.jpeg")),
+      plot = p,
+      width = 9,
+      height = 9,
+      dpi = 600,
+      units = "in"
+    )
+  }
+}
+
+plot_bulk_gsea_barplot_by_cluster(
+  gsea_df   = res$combined,   # or your per-cluster GSEA tibble
+  cluster_col = "cluster",    # use "ClusterID" if that's your column
+  output_dir = "edgeR_new_exploration/deg/Combo_Ribo/GSEA/barplots",
+  label      = "Combo_Ribo"
+)
+```
+
+### Obtaing synergy 
+```{r}
+p_exp
+metadata1
+metadata2 <- metadata %>%
+  mutate(
+    BMS_treat  = ifelse(Condition %in% c("BMS", "Combo"), 1, 0),
+    Ribo_treat = ifelse(Condition %in% c("Ribo", "Combo"), 1, 0)
+  )
+metadata2$BMS_treat  <- factor(metadata2$BMS_treat)
+metadata2$Ribo_treat <- factor(metadata2$Ribo_treat)
+str(metadata2)
+table(metadata2$Condition, metadata2$BMS_treat, metadata2$Ribo_treat)
+
+### Deseq
+## Creating DESEq object 
+dds2<- DESeqDataSetFromMatrix(countData = p_exp,
+                             colData = metadata2,
+                             design = ~ BMS_treat * Ribo_treat) # ~ BMS_treat * Ribo_treat 
+counts(dds2)
+
+## Estimating factors
+dds2<-estimateSizeFactors(dds2)
+## Performing DESEq
+dds2<-DESeq(dds2, 
+           full = design(dds2),
+           betaPrior = FALSE)
+resultsNames(dds2)
+
+#res<-results(dds, contrast = c("Condition","DMSO","BMS", "Ribo", "Combo"))
+### Exploration ###### ###########################
+res2 = results(dds2, name = "BMS_treat1.Ribo_treat1")
+head(res2[order(res2$padj),]) ## order to FDR
+### Subsetting the number of DEGs based on 1
+#deg<-subset(res, padj < 0.05 & abs(log2FoldChange) > 1 )
+
+
+#### saving this as excel file 
+CTX_FullTab2 <-as.data.frame(results(dds2, name = "BMS_treat1.Ribo_treat1", cooksCutoff = F, independentFiltering = F))%>%
+  rownames_to_column("Gene")
+CTX_DGE2 <- CTX_FullTab2 %>%
+  mutate(Abs = abs(log2FoldChange)) %>%
+  filter(padj < 0.1 & Abs > 0) %>%   ### FDR<0.05 and absolute value of 3 ( 100% up or down)
+  arrange(desc(Abs))
+
+
+CTX_DGE2$Gene
+### Saving this 
+library(writexl)
+write_xlsx(CTX_FullTab2, "edgeR_new_exploration/deg/Synergy_modeling/CTX_FullTab.xlsx")
+write_xlsx(CTX_DGE2, "edgeR_new_exploration/deg/Synergy_modeling/CTX_DGE.xlsx")
+save(dds2, file = "edgeR_new_exploration/deg/Synergy_modeling/dds2.RData")
+```
+
+### Loading DEGs and investigating the effect of the combo ######
+########################## ####################### ###############
+```{r}
+Ribo<- read_xlsx("edgeR_new_exploration/deg/Ribo_DMSO/CTX_DGE_shrink.xlsx")
+BMS<- read_xlsx("edgeR_new_exploration/deg/BMS_DMSO/CTX_DGE_shrink.xlsx")
+Combo<- read_xlsx("edgeR_new_exploration/deg/Combo_DMSO/CTX_DGE_shrink.xlsx")
+Combo_BMS<- read_xlsx("edgeR_new_exploration/deg/Combo_BMS/CTX_DGE_shrink.xlsx")
+Combo_Ribo<- read_xlsx("edgeR_new_exploration/deg/Combo_Ribo/CTX_DGE_shrink.xlsx")
+
+RiboDEGs <- Ribo %>%
+  mutate(LOG = -log10(padj), ABS = abs(log2FoldChange)) %>%
+  mutate(Threshold = if_else(padj < 0.05 & ABS > 0.3, "TRUE","FALSE")) %>%
+  mutate(Direction = case_when(log2FoldChange > 0.3 & padj < 0.05 ~ "UpReg", log2FoldChange < -0.3 & padj < 0.05 ~ "DownReg")) ### why 0.3
+BMSDEGs <- BMS %>%
+  mutate(LOG = -log10(padj), ABS = abs(log2FoldChange)) %>%
+  mutate(Threshold = if_else(padj < 0.05 & ABS > 0.3, "TRUE","FALSE")) %>%
+  mutate(Direction = case_when(log2FoldChange > 0.3 & padj < 0.05 ~ "UpReg", log2FoldChange < -0.3 & padj < 0.05 ~ "DownReg")) ### why 0.3
+ComboDEGs <- Combo %>%
+  mutate(LOG = -log10(padj), ABS = abs(log2FoldChange)) %>%
+  mutate(Threshold = if_else(padj < 0.05 & ABS > 0.3, "TRUE","FALSE")) %>%
+  mutate(Direction = case_when(log2FoldChange > 0.3 & padj < 0.05 ~ "UpReg", log2FoldChange < -0.3 & padj < 0.05 ~ "DownReg")) ### why 0.3
+Combo_BMSDEGs <- Combo_BMS %>%
+  mutate(LOG = -log10(padj), ABS = abs(log2FoldChange)) %>%
+  mutate(Threshold = if_else(padj < 0.05 & ABS > 0.3, "TRUE","FALSE")) %>%
+  mutate(Direction = case_when(log2FoldChange > 0.3 & padj < 0.05 ~ "UpReg", log2FoldChange < -0.3 & padj < 0.05 ~ "DownReg")) ### why 0.3
+Combo_RiboDEGs <- Combo_Ribo %>%
+  mutate(LOG = -log10(padj), ABS = abs(log2FoldChange)) %>%
+  mutate(Threshold = if_else(padj < 0.05 & ABS > 0.3, "TRUE","FALSE")) %>%
+  mutate(Direction = case_when(log2FoldChange > 0.3 & padj < 0.05 ~ "UpReg", log2FoldChange < -0.3 & padj < 0.05 ~ "DownReg")) ### why 0.3
+
+### BMS driven
+## Genes significantly changed in both BMS and Combo vs DMSO, not changed by Ribo, and Combo is not significantly different from BMS. → BMS is doing the heavy lifting.
+BMS_driven <- intersect(BMSDEGs$Gene, ComboDEGs$Gene) # Intersect BMS and Combo
+BMS_driven <- setdiff(BMS_driven, RiboDEGs$Gene) # exclude Ribo-driven
+BMS_driven <- setdiff(BMS_driven, Combo_BMS$Gene) # Combo not different from BMS
+BMS_driven <- setdiff(BMS_driven, CTX_DGE2$Gene) # keep synergy separate
+
+### Ribo driven 
+## Genes that change with Ribo and Combo, independent of BMS.
+Ribo_driven <- intersect(RiboDEGs$Gene, ComboDEGs$Gene) # Intersect Ribo and Combo
+Ribo_driven <- setdiff(Ribo_driven, BMSDEGs$Gene) # exclude BMS-driven
+Ribo_driven <- setdiff(Ribo_driven, Combo_RiboDEGs$Gene) # Combo not different from Ribo
+Ribo_driven <- setdiff(Ribo_driven, CTX_DGE2$Gene) # keep synergy separate
+
+### Combo driven
+## Changed only in Combo vs DMSO, not in either single-drug (within thresholds)
+### Combo-specific stress responses
+Combo_driven <- setdiff(ComboDEGs$Gene, union(BMSDEGs$Gene, RiboDEGs$Gene))
+Combo_driven <- setdiff(Combo_driven, CTX_DGE2$Gene)  # synergy kept separate
+
+
+### Venn diagram vs DMSO
+library(ggVennDiagram)
+gene_lists <- list(
+  BMS   = BMSDEGs$Gene,
+  Ribo  = RiboDEGs$Gene,
+  Combo = ComboDEGs$Gene
+)
+
+ggVennDiagram(gene_lists)
+library(ggvenn)
+p4<-ggvenn(
+  gene_lists, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#CD534CFF"),
+  stroke_size = 0.8, set_name_size = 4, show_percentage = F, text_size = 6,
+  auto_scale = F
+  )
+p4
+
+### Venn diagram vs driven genes 
+library(ggVennDiagram)
+gene_lists <- list(
+  BMS_driven   = BMS_driven,
+  Ribo_driven  = Ribo_driven,
+  Combo_driven = Combo_driven
+)
+library(ggvenn)
+p5<-ggvenn(
+  gene_lists, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#CD534CFF"),
+  stroke_size = 0.8, set_name_size = 4, show_percentage = F, text_size = 6,
+  auto_scale = F
+  )
+p5
+```
+##### Combo unique genes #####
+############ #################
+```{r}
+all(Combo_driven %in% Ribo$Gene)
+all(Combo_driven %in% BMS$Gene)
+all(Combo_driven %in% Combo$Gene)
+
+### Extracting unique Combo genes and BMS and RIbo 
+unique_Combo<- Combo[Combo$Gene %in% Combo_driven,]
+unique_BMS<- BMS[BMS$Gene %in% BMS_driven,]
+unique_Ribo<- Ribo[Ribo$Gene %in% Ribo_driven,]
+#### SAving them 
+
+#### Gene ontology above 
+
+#### Extracting the AMPK pathway genes 
+a<-toppData[toppData$Name == "AMP-activated protein kinase activity",]
+b <-a|> pull(Genes)
+AMP_genes<- c(
+  "Ern1","Rps6ka2","Cdc42bpa","Aak1","Lmtk2","Araf","Mtor","Stk36","Ripk2",
+  "Srpk2","Bcr","Ttbk2","Ttbk1","Sik2","Gsk3b","Dclk1","Trio","Taok2",
+  "Prkaa1","Prkag1","Prkx","Pskh1","Wnk4","Wnk3","Pikfyve")
+x<- p_exp[rownames(p_exp) %in% AMP_genes,]
+x <- x |> dplyr::select(1:3, 10:12)
+str(x)
+
+
+### Combo genes 
+AMPK_genes<-Combo_unique[Combo_unique$Gene %in% AMP_genes,]
+write_xlsx(AMPK_genes, "edgeR_new_exploration/deg/Unique_combo/AMP_uniq_combo.xlsx")
+
+x1 <- x |>
+  rownames_to_column("Gene") 
+
+df_long <- x1 |>
+  pivot_longer(
+    cols = -Gene,
+    names_to = "Sample",
+    values_to = "Count"
+  ) |>
+  mutate(
+    Condition = if_else(str_starts(Sample, "DMSO"), "DMSO", "Combo")
+  )
+
+# Summarise mean ± sd per gene & condition
+df_summary <- df_long |>
+  group_by(Gene, Condition) |>
+  summarise(
+    meanCount = mean(Count),
+    sdCount   = sd(Count),
+    .groups   = "drop"
+  )
+pdf("edgeR_new_exploration/deg/Unique_combo/AMP_signaling.pdf", width = 7, height = 5)
+ggplot(df_summary, aes(x = Condition, y = meanCount, fill = Condition)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(
+    aes(ymin = meanCount - sdCount, ymax = meanCount + sdCount),
+    width = 0.2
+  ) +
+  facet_wrap(~ Gene, scales = "free_y") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 8)
+  ) +
+  ylab("Mean log(CPMs +1)") +
+  xlab("") +
+  ggtitle("AMPK signalling genes")
+dev.off()
+
+
+df_long <- x |>
+  rownames_to_column("Gene") |>
+  pivot_longer(
+    cols = -Gene,
+    names_to = "Sample",
+    values_to = "Expression"
+  ) |>
+  mutate(
+    Condition = ifelse(grepl("^DMSO", Sample), "DMSO", "Combo")
+  )
+
+ggplot(df_long, aes(x = Condition, y = Expression)) +
+  geom_violin(trim = FALSE) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.7) +
+  facet_wrap(~ Gene, scales = "free_y") +
+  theme_bw() +
+  labs(x = "", y = "Expression (normalized counts)")
+
+
+write.csv(x1, file = "edgeR_new_exploration/deg/Unique_combo/AMP_signaling_cpms.csv")
+
+
+### Creating a logFC bettwen plot of BMS vs Combo
+BMSDEGs
+ComboDEGs
+
+# Join by gene
+fc_scatter <- BMSDEGs %>%
+  inner_join(ComboDEGs, by = "Gene")
+```
+
+##### Creating a cell signature ###########
+############## ############ ###############
+
+```{r}
+library(Seurat)
+library(AUCell)
+load("C:/Users/amade/Documents/Ocasio_data/output/SeuObject_noDoub_integrated.RData")
+DimPlot(seuObject_slim_nodoub, group.by = "celltype1")
+
+### AUCell signature of Combo genes that are upregulated and downregulated 
+Combo_up<- unique_Combo |> filter(log2FoldChange > 0) |> pull (Gene)
+Combo_down<- unique_Combo |> filter(log2FoldChange < 0) |> pull (Gene)
+### Creating signatures with AUCell
+AUCell_list <- list(`Upregulated in Combo` = Combo_up,
+                   `Downregulated in Combo` = Combo_down)
+## Obtaing the raw counts from the OPC object
+counts<- GetAssayData(seuObject_slim_nodoub, slot = "counts")
+### celrankings 
+cell_rankings<- AUCell_buildRankings(counts)
+## Calculate AUCell for each cell
+cells_AUC<- AUCell_calcAUC(AUCell_list, cell_rankings)
+### cell assignmant
+pdf("edgeR_new_exploration/deg/Unique_combo/AUCell/Thresholds.pdf")
+cells_assignment<- AUCell_exploreThresholds(cells_AUC, plotHist = T, assign = T)
+invisible(dev.off())
+## Checking output
+cells_assignment$geneSet$assignment
+
+########### Adding the cells back in metadata 
+auc_mtx <- t(getAUC(cells_AUC))          # cells x geneSets
+colnames(auc_mtx) <- paste0(colnames(auc_mtx), "_AUC")
+seuObject_slim_nodoub <- AddMetaData(seuObject_slim_nodoub, auc_mtx)
+View(seuObject_slim_nodoub@meta.data) 
+colnames(seuObject_slim_nodoub@meta.data)
+## matirces of up and downregulation:: 0.1 and 0.075
+
+########## Testing visualization #################
+########################## #######################
+feat <- "Downregulated in Combo_AUC"  # <- change as needed
+thr  <- 0.075
+col_bin <- paste0(feat, "_pos")
+
+seuObject_slim_nodoub[[col_bin]] <- seuObject_slim_nodoub[[feat]] >= thr
+#View(OPCs@meta.data)
+p<-DimPlot(
+  seuObject_slim_nodoub,
+  group.by = col_bin,
+  cols = c("FALSE" = "lightblue", "TRUE" = "#B2182B"), split.by = "Treatment"
+) + guides(colour = guide_legend())
+pdf("edgeR_new_exploration/deg/Unique_combo/AUCell/Downregulated_genes_Treatment.pdf", width = 10, height = 5)
+p
+dev.off()
+
+```
+```{r}
+library(enrichplot)
+
+emapplot(toppData, 
+         showCategory = 30,
+         layout = "kk")
+```
+####### GSEA and GO #####
+################## ######
+```{r}
+library(readxl)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+Combo<- read_xlsx("edgeR_new_exploration/deg/Combo_DMSO/CTX_FullTab_shrink.xlsx")
+#Combo_unique<- read_xlsx("edgeR_new_exploration/deg/Unique_combo/Combo_unique_CTX_DGE_shrink.xlsx")
+Ribo<- read_xlsx("edgeR_new_exploration/deg/Ribo_DMSO/CTX_FullTab_shrink.xlsx")
+BMS<- read_xlsx("edgeR_new_exploration/deg/BMS_DMSO/CTX_FullTab_shrink.xlsx")
+Combo_Ribo<- read_xlsx("edgeR_new_exploration/deg/Combo_Ribo/CTX_FullTab_shrink.xlsx")
+Combo_BMS<- read_xlsx("edgeR_new_exploration/deg/Combo_BMS/CTX_FullTab_shrink.xlsx")
+
+### GSEA and GO one by one 
+# Named numeric vector: logFC values with SYMBOL names
+logFC <-Ribo$log2FoldChange
+names(logFC) <- Ribo$Gene
+# Map SYMBOL -> ENTREZID (mouse)
+conv <- bitr(names(logFC),fromType = "SYMBOL",toType   = "ENTREZID",OrgDb = org.Mm.eg.db)
+# Keep only mapped genes; collapse duplicates (ENTREZID repeated) by max abs(logFC)
+df <- data.frame(SYMBOL = names(logFC), logFC = as.numeric(logFC))
+df <- dplyr::inner_join(df, conv, by = "SYMBOL")
+df <- df %>%dplyr::group_by(ENTREZID) %>%dplyr::summarise(logFC = logFC[which.max(abs(logFC))], .groups = "drop")
+geneList <- df$logFC
+names(geneList) <- df$ENTREZID
+geneList <- sort(geneList, decreasing = TRUE)
+#### Fixing gene list
+geneList <- geneList[is.finite(geneList)]
+geneList <- geneList[!is.na(names(geneList))]
+geneList <- geneList[!duplicated(names(geneList))]
+#geneList <- geneList[geneList != 0]
+set.seed(708)
+g <- gseGO(geneList = geneList,OrgDb= org.Mm.eg.db, keyType= "ENTREZID", ont= "BP", minGSSize=10, maxGSSize=500, pvalueCutoff = 1,verbose= FALSE, nPerm = 10000, eps= 0)
+if (is.null(g) || nrow(g@result) == 0) return(NULL)
+out <- g@result %>%dplyr::select(ID, Description, setSize, NES, pvalue, qvalue, core_enrichment) %>%dplyr::filter(qvalue < 0.05) #%>%dplyr::mutate(Cluster = paste0("Cluster ", ct))
+out
+
+#### Back into symbols 
+ent2sym <- bitr(unique(unlist(strsplit(out$core_enrichment, "/"))),fromType = "ENTREZID",toType = "SYMBOL",OrgDb= org.Mm.eg.db)
+sym_map <- setNames(ent2sym$SYMBOL, ent2sym$ENTREZID)
+out2 <- out %>%mutate(core_symbols = vapply(core_enrichment, function(x) {ids <- strsplit(x, "/", fixed = TRUE)[[1]]
+      syms <- unname(sym_map[ids])
+      syms <- syms[!is.na(syms)]
+      paste(unique(syms), collapse = "/")
+    }, FUN.VALUE = character(1))
+  )
+out2
+dir.create("edgeR_new_exploration/deg/Ribo_DMSO/GO_GSEA")
+write_xlsx(out2, "edgeR_new_exploration/deg/Ribo_DMSO/GO_GSEA/BP_GO_GSEA.xlsx")
+## viz 
+top5_up <- out %>%filter(NES > 0) %>%slice_max(order_by = NES, n = 20, with_ties = FALSE) %>% ungroup()
+top5_down <- out %>%filter(NES < 0) %>%slice_min(order_by = NES, n = 20, with_ties = FALSE) %>%ungroup()
+#top5_both <- bind_rows(top5_up, top5_down) %>% mutate(Direction = ifelse(NES > 0, "Up", "Down"))
+top5_both <- bind_rows(top5_up, top5_down) %>%mutate(Direction = ifelse(NES > 0, "Up", "Down"))
+#top5_both <- top5_both %>%distinct(ID, .keep_all = TRUE)
+top5_both <- bind_rows(top5_up, top5_down) %>%distinct(ID, .keep_all = TRUE) %>%arrange(NES) %>%                        mutate(Description = forcats::fct_inorder(Description))
+###
+pad <- 0.03 * diff(range(top5_both$NES, na.rm = TRUE))
+p<-ggplot(top5_both, aes(x = NES, y = Description, fill = NES > 0)) + geom_col(width = 0.75) + geom_vline(xintercept = 0, linewidth = 0.4) +
+  # GO IDs inside bars
+  geom_text(aes(label = ID), hjust = ifelse(top5_both$NES > 0, 1.05, -0.05), color = "white", size = 4) +
+  # Term names near x=0: left for positive, right for negative
+  geom_text(aes(x = ifelse(NES > 0, -pad, pad),label = Description),hjust = ifelse(top5_both$NES > 0, 1, 0),size = 3) +
+  tidytext::scale_y_reordered() +
+  scale_fill_manual(values = c(`TRUE` = "firebrick", `FALSE` = "firebrick3")) + ##4575B4
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, size = 16),legend.position = "none",
+    # remove y-axis line/ticks/labels since we now draw names ourselves
+    axis.line.y  = element_blank(),axis.ticks.y = element_blank(),axis.text.y  = element_blank(),axis.text.x  = element_text(size = 14),axis.title.x = element_text(size = 16),
+    # give room for the left/right text labels
+    plot.margin = margin(5.5, 80, 5.5, 80)
+  ) +
+  coord_cartesian(clip = "off") +labs(x = "NES", y = NULL,title = "GSEA (BP) | Ribo vs DMSO")
+pdf("edgeR_new_exploration/deg/Ribo_DMSO/GO_GSEA/BP_GO_GSEA_plot.pdf", width = 9, height = 7)
+p
+dev.off()
+```
+######### Progeny and decoupleR #####
+#######################
+```{r}
+library(readxl)
+library(progeny)
+library(RColorBrewer)
+library(decoupleR)
+library(writexl)
+
+counts(dds)
+vsd <- vst(dds, blind = FALSE)
+vst_mat <- assay(vsd)
+
+### Normalized vst scores
+vst_mat 
+## Loading metadata
+metadata<- read.csv("edgeR_new_exploration/metadata.csv")
+metadata
+
+### Downloading the get progeny from mice
+net <- decoupleR::get_progeny(organism = 'mouse', top = 500)
+#net1 <- progeny::getModel(organism = "Mouse", top = 500, decoupleR = TRUE)
+net
+write_xlsx(net, "edgeR_new_exploration/deg/decoupleR/get_progeny_mice.xlsx")
+
+### Activity inference and progeny model
+### Running mlm
+sample_acts <- decoupleR::run_mlm(mat = vst_mat, net = net, 
+                                  .source = 'source', 
+                                  .target = 'target',
+                                  .mor = 'weight', 
+                                  minsize = 5)
+
+sample_acts
+## viz
+sample_acts_mat <- sample_acts %>%
+                   tidyr::pivot_wider(id_cols = 'condition', 
+                                      names_from = 'source',
+                                      values_from = 'score') %>%
+                   tibble::column_to_rownames('condition') %>%
+                   as.matrix()
+
+# Scale per feature
+sample_acts_mat <- scale(sample_acts_mat)
+
+## viz
+pal <- viridis::magma(200)
+
+m <- max(abs(sample_acts_mat), na.rm = TRUE)
+breaks <- seq(-m, m, length.out = length(pal) + 1)
+pdf("edgeR_new_exploration/deg/decoupleR/decoupleR_Progeny_per_sample.pdf", height = 5, width = 10)
+pheatmap::pheatmap(
+  mat = t(sample_acts_mat),   
+  fontsize = 14,
+  fontsize_row = 12,
+  fontsize_col = 12,
+  color = pal,
+  breaks = breaks,
+  angle_col = 45,
+  treeheight_col = 0,
+  treeheight_row = 8,
+  border_color = "grey60",
+  cellwidth = 45,
+  cellheight = 15,
+  display_numbers = TRUE,
+  fontsize_number = 13,
+  number_color = "white"
+)
+dev.off()
+
+### Progeny means per condition
+###########################
+sample_acts_mat
+df_means <- as.data.frame(sample_acts_mat) %>%
+  rownames_to_column("sample") %>%
+  mutate(
+    Condition = sub("_.*", "", sample),
+    Condition = factor(Condition, levels = c("DMSO", "Ribo", "BMS", "Combo"))
+  )
+mean_per_condition <- df_means %>%
+  dplyr::select(-sample) %>%
+  group_by(Condition) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  tibble::column_to_rownames("Condition")
+
+## viz
+pal <- viridis::magma(200)
+m <- max(abs(mean_per_condition), na.rm = TRUE)
+breaks <- seq(-m, m, length.out = length(pal) + 1)
+pdf("edgeR_new_exploration/deg/decoupleR/decoupleR_Progeny_mean.pdf", height = 4, width = 6)
+pheatmap::pheatmap(
+  mat = t(mean_per_condition),
+  cluster_cols = F,
+  fontsize = 14,
+  fontsize_row = 12,
+  fontsize_col = 12,
+  color = pal,
+  breaks = breaks,
+  angle_col = 45,
+  treeheight_col = 0,
+  treeheight_row = 8,
+  border_color = "grey60",
+  cellwidth = 45,
+  cellheight = 15,
+  display_numbers = TRUE,
+  fontsize_number = 13,
+  number_color = "white"
+)
+dev.off()
+
+######################## ############ ############ ##################
+### Inference of pathway activities from stat values in Combo vs DMSO
+######################## ############ ############ ##################
+resultsNames(dds)
+res <- results(dds, name = "Condition_Combo_vs_DMSO")
+
+### loading unique genes 
+library(readxl)
+unique <- read_xlsx("edgeR_new_exploration/deg/Unique_combo/Combo_unique_CTX_DGE_shrink.xlsx")
+
+### Filtering res based to just get unique ones
+unique_genes <- unique(unique$Gene)
+unique_genes <- intersect(unique_genes, rownames(res))
+res_unique <- res[unique_genes, ]
+res_unique <- res_unique[order(res_unique$padj), ]
+res_unique
+
+## Adjust matrix
+deg <- as.data.frame(res_unique) %>%
+  rownames_to_column("ID") %>%
+  dplyr::select(ID, stat) %>%
+  filter(!is.na(stat)) %>%
+  column_to_rownames("ID") %>%
+  as.matrix()
+
+contrast_acts <- decoupleR::run_mlm(mat = deg, 
+                                    net = net, 
+                                    .source = 'source', 
+                                    .target = 'target',
+                                    .mor = 'weight', 
+                                    minsize = 5)
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu")[c(2, 10)])
+
+p <- ggplot2::ggplot(data = contrast_acts, 
+                     mapping = ggplot2::aes(x = stats::reorder(source, score), 
+                                            y = score)) + 
+     ggplot2::geom_bar(mapping = ggplot2::aes(fill = score),
+                       color = "black",
+                       stat = "identity") +
+     ggplot2::scale_fill_gradient2(low = colors[1], 
+                                   mid = "whitesmoke", 
+                                   high = colors[2], 
+                                   midpoint = 0) + 
+     ggplot2::theme_minimal() +
+     ggplot2::theme(axis.title = element_text(face = "bold", size = 12),
+              axis.text.x = ggplot2::element_text(angle = 45, 
+                                                  hjust = 1, 
+                                                  size = 10, 
+                                                  face = "bold"),
+              axis.text.y = ggplot2::element_text(size = 10, 
+                                                  face = "bold"),
+              panel.grid.major = element_blank(), 
+              panel.grid.minor = element_blank()) +
+     ggplot2::xlab("Pathways")
+
+p
+write_xlsx(contrast_acts, "edgeR_new_exploration/deg/decoupleR/Progeny/CombovsDMSO/UniquedecoupleR_progeny_CombovsDMSO.xlsx")
+
+### Scatter plot visualization....
+pathway <- c('TNFa')
+df <- net %>%
+      dplyr::filter(source == pathway) %>%
+      dplyr::arrange(target) %>%
+      dplyr::mutate(ID = target, 
+                    color = "3") %>%
+      tibble::column_to_rownames('target')
+inter <- sort(dplyr::intersect(rownames(deg), rownames(df)))
+df <- df[inter, ]
+df['stat'] <- deg[inter, ]
+df <- df %>%
+      dplyr::mutate(color = dplyr::if_else(weight > 0 & stat > 0, '1', color)) %>%
+      dplyr::mutate(color = dplyr::if_else(weight > 0 & stat < 0, '2', color)) %>%
+      dplyr::mutate(color = dplyr::if_else(weight < 0 & stat > 0, '2', color)) %>%
+      dplyr::mutate(color = dplyr::if_else(weight < 0 & stat < 0, '1', color))
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu")[c(2, 10)])
+p1 <- ggplot2::ggplot(data = df, 
+                     mapping = ggplot2::aes(x = weight, 
+                                            y = stat, 
+                                            color = color)) + 
+     ggplot2::geom_point(size = 2.5, 
+                         color = "black") + 
+     ggplot2::geom_point(size = 1.5) +
+     ggplot2::scale_colour_manual(values = c(colors[2], colors[1], "grey")) +
+     ggrepel::geom_label_repel(mapping = ggplot2::aes(label = ID)) + 
+     ggplot2::theme_minimal() +
+     ggplot2::theme(legend.position = "none") +
+     ggplot2::geom_vline(xintercept = 0, linetype = 'dotted') +
+     ggplot2::geom_hline(yintercept = 0, linetype = 'dotted') +
+     ggplot2::ggtitle(pathway)
+
+p1
+
+pdf("edgeR_new_exploration/deg/decoupleR/Progeny/CombovsDMSO/unique_decoupleR_barplot.pdf", height =5, width = 7)
+p
+dev.off()
+
+pdf("edgeR_new_exploration/deg/decoupleR/Progeny/CombovsDMSO/unique_decoupleR_TGFb.pdf", height =5, width = 7)
+p1
+dev.off()
+```
+######## Trancription factor inference ########
+################ ############### ##############
+```{r}
+## Transcription factors : also saved in Denis'file
+net <- decoupleR::get_collectri(organism = 'mouse', 
+                                split_complexes = FALSE)
+
+net
+
+# Run ulm
+sample_acts <- decoupleR::run_ulm(mat = vst_mat, 
+                                  net = net, 
+                                  .source = 'source', 
+                                  .target = 'target',
+                                  .mor = 'mor', 
+                                  minsize = 5)
+
+n_tfs <- 25
+
+# Transform to wide matrix
+sample_acts_mat <- sample_acts %>%
+                   tidyr::pivot_wider(id_cols = 'condition', 
+                                      names_from = 'source',
+                                      values_from = 'score') %>%
+                   tibble::column_to_rownames('condition') %>%
+                   as.matrix()
+
+# Get top tfs with more variable means across clusters
+tfs <- sample_acts %>%
+       dplyr::group_by(source) %>%
+       dplyr::summarise(std = stats::sd(score)) %>%
+       dplyr::arrange(-abs(std)) %>%
+       head(n_tfs) %>%
+       dplyr::pull(source)
+
+sample_acts_mat <- sample_acts_mat[,tfs]
+
+# Scale per sample
+sample_acts_mat <- scale(sample_acts_mat)
+
+# Choose color palette
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))
+colors.use <- grDevices::colorRampPalette(colors = colors)(100)
+
+my_breaks <- c(seq(-2, 0, length.out = ceiling(100 / 2) + 1),
+               seq(0.05, 2, length.out = floor(100 / 2)))
+
+# Plot
+pheatmap::pheatmap(mat = sample_acts_mat,
+                   color = colors.use,
+                   border_color = "white",
+                   breaks = my_breaks,
+                   cellwidth = 15,
+                   cellheight = 15,
+                   treeheight_row = 20,
+                   treeheight_col = 20)
+
+#### Runnning contrats
+########################
+#########################
+resultsNames(dds)
+res <- results(dds, name = "Condition_Combo_vs_DMSO")
+res
+
+### loading unique genes 
+library(readxl)
+#unique <- read_xlsx("edgeR_new_exploration/deg/Unique_combo/Combo_unique_CTX_DGE_shrink.xlsx")
+
+### Filtering res based to just get unique ones
+unique_genes <- unique(unique$Gene)
+unique_genes <- intersect(unique_genes, rownames(res))
+res_unique <- res[unique_genes, ]
+res_unique <- res_unique[order(res_unique$padj), ]
+res_unique
+
+## Adjust matrix
+deg <- as.data.frame(res_unique) %>%
+  rownames_to_column("ID") %>%
+  dplyr::select(ID, stat, log2FoldChange, pvalue ) %>%
+  filter(!is.na(stat)) %>%
+  column_to_rownames("ID") %>%
+  as.matrix()
+
+str(deg)
+contrast_acts <- decoupleR::run_ulm(mat = deg[, 'stat', drop = FALSE], 
+                                    net = net, 
+                                    .source = 'source', 
+                                    .target = 'target',
+                                    .mor='mor', 
+                                    minsize = 5)
+
+contrast_acts
+contrast_acts<- contrast_acts |> filter( p_value < 0.5)
+
+#### viz 
+# Filter top TFs in both signs
+f_contrast_acts <- contrast_acts %>%
+                   dplyr::mutate(rnk = NA)
+
+msk <- f_contrast_acts$score > 0
+
+f_contrast_acts[msk, 'rnk'] <- rank(-f_contrast_acts[msk, 'score'])
+f_contrast_acts[!msk, 'rnk'] <- rank(-abs(f_contrast_acts[!msk, 'score']))
+
+tfs <- f_contrast_acts %>%
+       dplyr::arrange(rnk) %>%
+       head(n_tfs) %>%
+       dplyr::pull(source)
+
+f_contrast_acts <- f_contrast_acts %>%
+                   filter(source %in% tfs)
+
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu")[c(2, 10)])
+
+p <- ggplot2::ggplot(data = f_contrast_acts, 
+                     mapping = ggplot2::aes(x = stats::reorder(source, score), 
+                                            y = score)) + 
+     ggplot2::geom_bar(mapping = ggplot2::aes(fill = score),
+                       color = "black",
+                       stat = "identity") +
+     ggplot2::scale_fill_gradient2(low = colors[1], 
+                                   mid = "whitesmoke", 
+                                   high = colors[2], 
+                                   midpoint = 0) + 
+     ggplot2::theme_minimal() +
+     ggplot2::theme(axis.title = element_text(face = "bold", size = 12),
+              axis.text.x = ggplot2::element_text(angle = 45, 
+                                                  hjust = 1, 
+                                                  size = 10, 
+                                                  face = "bold"),
+              axis.text.y = ggplot2::element_text(size = 10, 
+                                                  face = "bold"),
+              panel.grid.major = element_blank(), 
+              panel.grid.minor = element_blank()) +
+     ggplot2::xlab("TFs")
+
+p
+
+```
+```{r}
+str(deg)
+tf <- 'Nr4a1'
+
+df <- net %>%
+      dplyr::filter(source == tf) %>%
+      dplyr::arrange(target) %>%
+      dplyr::mutate(ID = target, color = "3") %>%
+      tibble::column_to_rownames('target')
+
+inter <- sort(dplyr::intersect(rownames(deg), rownames(df)))
+
+df <- df[inter, ]
+
+df$logfc   <- deg[inter, "log2FoldChange"]
+df$stat    <- deg[inter, "stat"]
+df$p_value <- deg[inter, "pvalue"]
+
+df <- df %>%
+      dplyr::mutate(color = dplyr::if_else(mor > 0 & stat > 0, '1', color)) %>%
+      dplyr::mutate(color = dplyr::if_else(mor > 0 & stat < 0, '2', color)) %>%
+      dplyr::mutate(color = dplyr::if_else(mor < 0 & stat > 0, '2', color)) %>%
+      dplyr::mutate(color = dplyr::if_else(mor < 0 & stat < 0, '1', color))
+
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu")[c(2, 10)])
+
+p <- ggplot2::ggplot(data = df, 
+                     mapping = ggplot2::aes(x = logfc, 
+                                            y = -log10(p_value), 
+                                            color = color,
+                                            size = abs(mor))) + 
+     ggplot2::geom_point(size = 2.5, 
+                         color = "black") + 
+     ggplot2::geom_point(size = 1.5) +
+     ggplot2::scale_colour_manual(values = c(colors[2], colors[1], "grey")) +
+     ggrepel::geom_label_repel(mapping = ggplot2::aes(label = ID,
+                                                      size = 1)) + 
+     ggplot2::theme_minimal() +
+     ggplot2::theme(legend.position = "none") +
+     ggplot2::geom_vline(xintercept = 0, linetype = 'dotted') +
+     ggplot2::geom_hline(yintercept = 0, linetype = 'dotted') +
+     ggplot2::ggtitle(tf)
+
+p
+
+
+
+```
+
+
+######## Normal progeny scores #########
+################### ########### ########
+``` {r}
+mt<- read_xlsx("edgeR_new_exploration/deg/gene_cpm.xlsx")
+mt<- mt |> column_to_rownames("Gene")
+mt<- as.matrix(mt)
+
+progeny_df <- progeny(mt, scale=T, organism="Mouse", top=100, perm=1, 
+    return_assay = TRUE)
+
+pal <- magma(200)
+m <- max(abs(progeny_mat), na.rm = TRUE)
+breaks <- seq(-m, m, length.out = length(pal) + 1)
+
+# samples as rows, pathways as columns
+#pdf("edgeR_new_exploration/deg/Progeny_per_sample.pdf", height = 5, width = 10)
+pheatmap(
+  t(progeny_mat),
+  fontsize = 14,
+  fontsize_row = 12,
+  fontsize_col = 12,
+  color = pal,
+  breaks = breaks,
+  angle_col = 45,
+  treeheight_col = 0,
+  treeheight_row = 8,
+  border_color = "grey60",
+  cellwidth = 45,
+  cellheight = 15,
+  display_numbers = TRUE,
+  fontsize_number = 13,
+  number_color = "white"
+)
+#dev.off()
+```
+
