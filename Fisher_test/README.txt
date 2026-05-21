@@ -1,0 +1,1 @@
+This folder contains the output from Fisher_test_onlyTME.R and Fisher_test_wholeObject.R that are the inputs to generate the Fisher enrichment test outputs from 05_Enrichments.sh (Whole Object) and 06_Enrichments.sh (TME).
